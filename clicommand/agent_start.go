@@ -2,6 +2,7 @@ package clicommand
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -75,6 +76,7 @@ type AgentStartConfig struct {
 	NoPluginValidation         bool     `cli:"no-plugin-validation"`
 	NoPTY                      bool     `cli:"no-pty"`
 	TimestampLines             bool     `cli:"timestamp-lines"`
+	HealthCheckAddr            string   `cli:"health-check-addr"`
 	MetricsDatadog             bool     `cli:"metrics-datadog"`
 	MetricsDatadogHost         string   `cli:"metrics-datadog-host"`
 	Spawn                      int      `cli:"spawn"`
@@ -297,6 +299,11 @@ var AgentStartCommand = cli.Command{
 			Name:   "timestamp-lines",
 			Usage:  "Prepend timestamps on each line of output.",
 			EnvVar: "BUILDKITE_TIMESTAMP_LINES",
+		},
+		cli.StringFlag{
+			Name:   "health-check-addr",
+			Usage:  "Start an HTTP server on this addr:port that returns whether the agent is healthy, disabled by default",
+			EnvVar: "BUILDKITE_AGENT_HEALTH_CHECK_ADDR",
 		},
 		cli.BoolFlag{
 			Name:   "no-pty",
@@ -605,14 +612,6 @@ var AgentStartCommand = cli.Command{
 			}),
 		}
 
-		// The common configuration for all workers
-		workerConf := agent.AgentWorkerConfig{
-			AgentConfiguration: agentConf,
-			Debug:              cfg.Debug,
-			Endpoint:           apiClientConf.Endpoint,
-			DisableHTTP2:       apiClientConf.DisableHTTP2,
-		}
-
 		var workers []*agent.AgentWorker
 
 		for i := 1; i <= cfg.Spawn; i++ {
@@ -631,11 +630,36 @@ var AgentStartCommand = cli.Command{
 			// Create an agent worker to run the agent
 			workers = append(workers,
 				agent.NewAgentWorker(
-					l.WithFields(logger.StringField(`agent`, ag.Name)), ag, mc, workerConf))
+					l.WithFields(logger.StringField(`agent`, ag.Name)), ag, mc, agent.AgentWorkerConfig{
+						AgentConfiguration: agentConf,
+						Debug:              cfg.Debug,
+						Endpoint:           apiClientConf.Endpoint,
+						DisableHTTP2:       apiClientConf.DisableHTTP2,
+						SpawnIndex:         i,
+					}))
 		}
 
 		// Setup the agent pool that spawns agent workers
 		pool := agent.NewAgentPool(l, workers)
+
+		// Determine the health check listening address and port for this agent
+		if cfg.HealthCheckAddr != "" {
+			http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/" {
+					http.NotFound(w, r)
+				} else {
+					fmt.Fprintf(w, "OK: Buildkite agent is running")
+				}
+			})
+
+			go func() {
+				l.Notice("Starting HTTP health check server on %v", cfg.HealthCheckAddr)
+				err := http.ListenAndServe(cfg.HealthCheckAddr, nil)
+				if err != nil {
+					l.Error("Could not start health check server: %v", err)
+				}
+			}()
+		}
 
 		// Start the agent pool
 		if err := pool.Start(); err != nil {

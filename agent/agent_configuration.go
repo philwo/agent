@@ -22,6 +22,7 @@ type AgentConfiguration struct {
 	LocalHooksEnabled          bool
 	RunInPty                   bool
 	TimestampLines             bool
+	HealthCheckAddr            string
 	DisconnectAfterJob         bool
 	DisconnectAfterJobTimeout  int
 	DisconnectAfterIdleTimeout int
