@@ -3,9 +3,10 @@ package agent
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/buildkite/agent/api"
@@ -19,16 +20,25 @@ type AgentWorkerConfig struct {
 	// Whether to set debug in the job
 	Debug bool
 
+	// The index of this agent worker
+	SpawnIndex int
+
 	// The configuration of the agent from the CLI
 	AgentConfiguration AgentConfiguration
 }
 
-type AgentWorker struct {
+type agentStats struct {
+	sync.Mutex
+
 	// Tracks the last successful heartbeat and ping
-	// NOTE: to avoid alignment issues on ARM architectures when
-	// using atomic.StoreInt64 we need to keep this at the beginning
-	// of the struct
-	lastPing, lastHeartbeat int64
+	lastPing, lastHeartbeat time.Time
+
+	// The last error that occurred during heartbeat, or nil if it was successful
+	lastHeartbeatError error
+}
+
+type AgentWorker struct {
+	stats agentStats
 
 	// The API Client used when this agent is communicating with the API
 	apiClient APIClient
@@ -56,6 +66,9 @@ type AgentWorker struct {
 	stopping  bool
 	stopMutex sync.Mutex
 
+	// The index of this agent worker
+	spawnIndex int
+
 	// When this worker runs a job, we'll store an instance of the
 	// JobRunner here
 	jobRunner *JobRunner
@@ -71,6 +84,7 @@ func NewAgentWorker(l logger.Logger, a *api.AgentRegisterResponse, m *metrics.Co
 		debug:              c.Debug,
 		agentConfiguration: c.AgentConfiguration,
 		stop:               make(chan struct{}),
+		spawnIndex:         c.SpawnIndex,
 	}
 }
 
@@ -98,6 +112,23 @@ func (a *AgentWorker) Start(idleMonitor *IdleMonitor) error {
 	heartbeatCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Register our worker specific health check handler
+	http.HandleFunc("/agent/"+strconv.Itoa(a.spawnIndex), func(w http.ResponseWriter, r *http.Request) {
+		a.stats.Lock()
+		defer a.stats.Unlock()
+
+		if a.stats.lastHeartbeatError != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "ERROR: last heartbeat failed: %v. last successful was %v ago", a.stats.lastHeartbeatError, time.Since(a.stats.lastHeartbeat))
+		} else {
+			if a.stats.lastHeartbeat.IsZero() {
+				fmt.Fprintf(w, "OK: no heartbeat yet")
+			} else {
+				fmt.Fprintf(w, "OK: last heartbeat successful %v ago", time.Since(a.stats.lastHeartbeat))
+			}
+		}
+	})
+
 	// Setup and start the heartbeater
 	go func() {
 		for {
@@ -106,10 +137,10 @@ func (a *AgentWorker) Start(idleMonitor *IdleMonitor) error {
 				err := a.Heartbeat()
 				if err != nil {
 					// Get the last heartbeat time to the nearest microsecond
-					lastHeartbeat := time.Unix(atomic.LoadInt64(&a.lastPing), 0)
-
+					a.stats.Lock()
 					a.logger.Error("Failed to heartbeat %s. Will try again in %s. (Last successful was %v ago)",
-						err, heartbeatInterval, time.Now().Sub(lastHeartbeat))
+						err, heartbeatInterval, time.Now().Sub(a.stats.lastHeartbeat))
+					a.stats.Unlock()
 				}
 
 			case <-heartbeatCtx.Done():
@@ -260,12 +291,17 @@ func (a *AgentWorker) Heartbeat() error {
 		return err
 	}, &retry.Config{Maximum: 5, Interval: 5 * time.Second})
 
+	a.stats.Lock()
+	defer a.stats.Unlock()
+
+	a.stats.lastHeartbeatError = err
+
 	if err != nil {
 		return err
 	}
 
 	// Track a timestamp for the successful heartbeat for better errors
-	atomic.StoreInt64(&a.lastHeartbeat, time.Now().Unix())
+	a.stats.lastHeartbeat = time.Now()
 
 	a.logger.Debug("Heartbeat sent at %s and received at %s", beat.SentAt, beat.ReceivedAt)
 	return nil
@@ -280,15 +316,18 @@ func (a *AgentWorker) Ping() (*api.Job, error) {
 	ping, _, err := a.apiClient.Ping()
 	if err != nil {
 		// Get the last ping time to the nearest microsecond
-		lastPing := time.Unix(atomic.LoadInt64(&a.lastPing), 0)
+		a.stats.Lock()
+		defer a.stats.Unlock()
 
 		// If a ping fails, we don't really care, because it'll
 		// ping again after the interval.
-		return nil, fmt.Errorf("Failed to ping: %v (Last successful was %v ago)", err, time.Now().Sub(lastPing))
+		return nil, fmt.Errorf("Failed to ping: %v (Last successful was %v ago)", err, a.stats.lastPing)
 	}
 
 	// Track a timestamp for the successful ping for better errors
-	atomic.StoreInt64(&a.lastPing, time.Now().Unix())
+	a.stats.Lock()
+	a.stats.lastPing = time.Now()
+	a.stats.Unlock()
 
 	// Should we switch endpoints?
 	if ping.Endpoint != "" && ping.Endpoint != a.agent.Endpoint {
