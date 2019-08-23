@@ -3,6 +3,7 @@
 /releases
 /deb
 /rpm
+/bin
 /vendor/bundle
 /vendor/pkg
 .bundle
